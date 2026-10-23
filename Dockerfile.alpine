@@ -1,0 +1,215 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+# musl has no getrpcent(), which Snort's AppId RPC detector calls, so it
+# comes from libtirpc.
+RUN apk add --no-cache \
+      autoconf \
+      automake \
+      brotli-dev \
+      build-base \
+      ca-certificates \
+      cmake \
+      flex \
+      flex-dev \
+      git \
+      hwloc-dev \
+      libdnet-dev \
+      libpcap-dev \
+      libtirpc-dev \
+      libtool \
+      linux-headers \
+      luajit-dev \
+      openssl-dev \
+      pcre2-dev \
+      pkgconf \
+      samurai \
+      scanelf \
+      util-linux-dev \
+      vectorscan-dev \
+      xz-dev \
+      zlib-dev
+
+# Snort attaches only its documentation to releases and does not sign its
+# tags, so the release tag is cloned and must point to the commit pinned in
+# package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${VERSION}" \
+      https://github.com/snort3/snort3.git /src/snort3; \
+    test "$(git -C /src/snort3 rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag ${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    awk -v v="${VERSION}" 'BEGIN { split(v, p, "."); printf "set (VERSION_MAJOR %s)\nset (VERSION_MINOR %s)\nset (VERSION_PATCH %s)\nset (VERSION_SUBLEVEL %s)\n", p[1], p[2], p[3], p[4] }' \
+      > /tmp/version-lines; \
+    grep -E '^set \(VERSION_(MAJOR|MINOR|PATCH|SUBLEVEL) ' /src/snort3/CMakeLists.txt | cmp -s - /tmp/version-lines \
+      || { echo "CMakeLists.txt does not set version ${VERSION}" >&2; exit 1; }
+
+# LibDAQ is built with shared libraries enabled only because it installs the
+# pkg-config files of its static modules in that case, and Snort finds the
+# modules through them. Snort links libdaq.a and those modules statically, so
+# the image has no LibDAQ files of its own. NFQ, netmap and divert are left
+# out: they need libraries or kernels the image does not have.
+ARG LIBDAQ_VERSION
+ARG LIBDAQ_SHA256
+ADD --checksum=sha256:${LIBDAQ_SHA256} https://github.com/snort3/libdaq/archive/refs/tags/v${LIBDAQ_VERSION}.tar.gz /src/libdaq.tar.gz
+ARG JOBS
+WORKDIR /src/libdaq
+RUN tar -xzf /src/libdaq.tar.gz --strip-components=1; \
+    autoreconf -fi; \
+    ./configure \
+      --prefix=/build/daq \
+      --enable-shared \
+      --enable-static \
+      --with-pic \
+      --disable-divert-module \
+      --disable-netmap-module \
+      --disable-nfq-module; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make install; \
+    export PKG_CONFIG_PATH=/build/daq/lib/pkgconfig; \
+    case "$(pkg-config --modversion libdaq)" in \
+      "${LIBDAQ_VERSION}"|"${LIBDAQ_VERSION}".*) ;; \
+      *) echo "the archive is not LibDAQ ${LIBDAQ_VERSION}" >&2; exit 1 ;; \
+    esac; \
+    min="$(sed -n 's/.*libdaq>=\([0-9.]*\)).*/\1/p' /src/snort3/cmake/FindDAQ.cmake)"; \
+    test -n "${min}" || { echo "no LibDAQ minimum in cmake/FindDAQ.cmake" >&2; exit 1; }; \
+    pkg-config --atleast-version="${min}" libdaq \
+      || { echo "Snort ${VERSION} needs LibDAQ ${min} or later; update the libdaq extra artifact in package.yml (${LIBDAQ_VERSION})" >&2; exit 1; }; \
+    for f in /build/daq/lib/pkgconfig/libdaq_static_*.pc; do m="${f##*/libdaq_static_}"; echo "${m%.pc}"; done > /tmp/daq-modules; \
+    printf '%s\n' afpacket bpf dump fst gwlb pcap savefile trace | cmp -s - /tmp/daq-modules \
+      || { echo "unexpected LibDAQ modules:" >&2; cat /tmp/daq-modules >&2; exit 1; }
+
+# Optional libraries are found without an error when they are missing, so the
+# ones the image does not use are switched off here and the ones it does use
+# are checked after the build. NUMA stays off because snort's own numa.h can
+# shadow the system header (snort3/snort3#368). ENABLE_COREFILES=OFF makes
+# snort lower its hard core-file limit to 0 at startup; setrlimit() rejects
+# that while the soft limit is higher, so the README adds --ulimit core=0.
+# appid_detector_builder.sh is a Bash script, and show_flows reads flow dumps
+# that only Snort's shell writes, which is not built.
+WORKDIR /src/snort3
+RUN export PKG_CONFIG_PATH=/build/daq/lib/pkgconfig; \
+    cmake -S . -B /build/snort -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DDAQ_INCLUDE_DIR_HINT=/build/daq/include \
+      -DDAQ_LIBRARIES=/build/daq/lib/libdaq.a \
+      -DENABLE_STATIC_DAQ=ON \
+      -DENABLE_COREFILES=OFF \
+      -DENABLE_GDB=OFF \
+      -DENABLE_SAFEC=OFF \
+      -DENABLE_UNIT_TESTS=OFF \
+      -DENABLE_BENCHMARK_TESTS=OFF \
+      -DMAKE_DOC=OFF \
+      -DMAKE_HTML_DOC=OFF \
+      -DMAKE_PDF_DOC=OFF \
+      -DMAKE_TEXT_DOC=OFF \
+      -DCMAKE_DISABLE_FIND_PACKAGE_Libunwind=ON \
+      -DCMAKE_DISABLE_FIND_PACKAGE_ML=ON \
+      -DCMAKE_DISABLE_FIND_PACKAGE_NUMA=ON; \
+    cmake --build /build/snort -j"${JOBS:-$(nproc)}"; \
+    DESTDIR=/out cmake --install /build/snort --strip; \
+    rm -rf /out/usr/local/include /out/usr/local/lib/pkgconfig /out/usr/local/share/doc \
+      /out/usr/local/bin/appid_detector_builder.sh /out/usr/local/bin/show_flows
+
+ARG BASE_IMAGE
+# The build fails unless the optional libraries the image is meant to have
+# were found and linked, LibDAQ and its modules are compiled in, and snort
+# reports the expected versions. The licenses of LibDAQ's daq_dlt.h
+# (BSD-3-Clause, from libpcap), its MurmurHash3 code (public domain), Snort's
+# timersub.h (LGPL-2.1-or-later) and flex's FlexLexer.h (BSD-3-Clause-flex,
+# whose inline code the JavaScript and PDF normalizers compile in) are cut from
+# the comments of those files; licenses/ holds the LGPL-2.1 text, which the
+# sources lack.
+# runtime-deps lists the so: names snort and its DAQ modules need, plus the
+# packages in runtime-deps.alpine.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    --mount=type=bind,source=licenses,target=/tmp/licenses.extra \
+    bin=/out/usr/local/bin; \
+    for f in "${bin}"/*; do echo "${f##*/}"; done > /tmp/tools; \
+    printf '%s\n' snort snort2lua u2boat u2spewfoo | cmp -s - /tmp/tools \
+      || { echo "unexpected tools:" >&2; cat /tmp/tools >&2; exit 1; }; \
+    for f in /out/usr/local/lib/snort/daq/*; do echo "${f##*/}"; done > /tmp/daq-dynamic; \
+    printf '%s\n' daq_file.so daq_hext.so | cmp -s - /tmp/daq-dynamic \
+      || { echo "unexpected DAQ modules:" >&2; cat /tmp/daq-dynamic >&2; exit 1; }; \
+    missing=; \
+    for d in HAVE_BROTLI HAVE_HYPERSCAN HAVE_ICONV HAVE_LZMA HAVE_UUID USE_TIRPC; do \
+      grep -Fqx "#define ${d} 1" /build/snort/config.h || missing="${missing} ${d}"; \
+    done; \
+    for d in HAVE_JEMALLOC HAVE_LIBML HAVE_LIBUNWIND HAVE_NUMA HAVE_SAFEC; do \
+      if grep -Fqx "#define ${d} 1" /build/snort/config.h; then missing="${missing} !${d}"; fi; \
+    done; \
+    test -z "${missing}" || { echo "config.h:${missing}" >&2; exit 1; }; \
+    readelf -d "${bin}/snort" > /tmp/dynamic; \
+    for lib in libbrotlidec libcrypto libhs liblzma libtirpc libuuid; do \
+      grep -Eq "NEEDED.*\[${lib}\.so\.[0-9]" /tmp/dynamic || { echo "snort does not load ${lib}" >&2; exit 1; }; \
+    done; \
+    if grep -q 'NEEDED.*libdaq' /tmp/dynamic; then echo "snort loads a shared LibDAQ" >&2; exit 1; fi; \
+    "${bin}/snort" -V > /tmp/snort-version; \
+    grep -Fxq "  o\"  )~   Version ${VERSION}" /tmp/snort-version \
+      || { cat /tmp/snort-version >&2; echo "snort is not version ${VERSION}" >&2; exit 1; }; \
+    for f in "Using DAQ version ${LIBDAQ_VERSION}" 'Using Brotli version' 'Using Hyperscan version' 'Using LZMA version'; do \
+      grep -Fq "${f}" /tmp/snort-version || { cat /tmp/snort-version >&2; echo "missing: ${f}" >&2; exit 1; }; \
+    done; \
+    "${bin}/snort" --daq-list > /tmp/daq-list; \
+    while read -r m; do \
+      grep -Eq "^${m}\(v[0-9]+\):" /tmp/daq-list || { cat /tmp/daq-list >&2; echo "DAQ module ${m} is not compiled in" >&2; exit 1; }; \
+    done < /tmp/daq-modules; \
+    meta=/out/usr/local/share/randomcontainers/snort3; \
+    mkdir -p "${meta}/licenses"; \
+    cp LICENSE "${meta}/licenses/LICENSE"; \
+    cp /src/libdaq/LICENSE "${meta}/licenses/LICENSE.libdaq"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Regents of the University of California/) { printf "%s", b; f = 1; exit } } END { exit !f }' \
+      /src/libdaq/api/daq_dlt.h > "${meta}/licenses/LICENSE.libdaq-dlt"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /placed in the public/) { printf "%s", b; f = 1; exit } } END { exit !f }' \
+      /src/libdaq/modules/fst/PMurHash.c > "${meta}/licenses/LICENSE.libdaq-murmurhash"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Lesser General Public/) { printf "%s", b; f = 1; exit } } END { exit !f }' \
+      src/time/timersub.h > "${meta}/licenses/LICENSE.timersub"; \
+    awk '/Copyright.*Regents of the University of California/ { f = 1 } f { print } f && /PURPOSE\./ { d = 1; exit } END { exit !d }' \
+      /usr/include/FlexLexer.h > "${meta}/licenses/LICENSE.flexlexer"; \
+    cp /tmp/licenses.extra/LGPL-2.1 "${meta}/licenses/LGPL-2.1"; \
+    echo "${VERSION}" > "${meta}/version"; \
+    printf '%s\n' \
+      "https://github.com/snort3/snort3.git@${SOURCE_COMMIT}" \
+      "https://github.com/snort3/snort3/tree/${SOURCE_COMMIT}" \
+      "https://github.com/snort3/libdaq/archive/refs/tags/v${LIBDAQ_VERSION}.tar.gz" \
+      "https://github.com/randomcontainers/snort3/releases/tag/v${VERSION}" \
+      > "${meta}/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | head -n 1)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "libdaq: ${LIBDAQ_VERSION} sha256:${LIBDAQ_SHA256}"; \
+      echo "openssl: $(pkg-config --modversion libcrypto)"; \
+      grep -E '^(CMAKE_BUILD_TYPE|DAQ_STATIC_MODULES|ENABLE_[A-Z0-9_]+|STATIC_[A-Z_]+):' /build/snort/CMakeCache.txt; \
+      cat /tmp/snort-version; \
+    } > "${meta}/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    grep -q '^libhs\.so\.' /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "${meta}/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/snort3/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "snort"]
+CMD ["--help"]
