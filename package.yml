@@ -1,0 +1,169 @@
+name: snort3
+title: Snort 3
+summary: Network intrusion detection that runs Snort 3 rules against packet captures or live traffic and writes alerts as text, JSON or unified2.
+homepage: https://www.snort.org/
+# Snort and LibDAQ (GPL-2.0-only), the glibc timersub macro in
+# src/time/timersub.h (LGPL-2.1-or-later), LibDAQ's daq_dlt.h, taken from
+# libpcap (BSD-3-Clause), flex's FlexLexer.h, whose inline code the JavaScript
+# and PDF normalizers compile in (BSD-3-Clause-flex), and LibDAQ's MurmurHash3
+# code in the fst module (public domain).
+license: GPL-2.0-only AND LGPL-2.1-or-later AND BSD-3-Clause AND BSD-3-Clause-flex AND LicenseRef-Public-Domain
+source-release: true
+upstream:
+  source: github-release
+  repository: snort3/snort3
+  # Release tags have four parts, such as 3.12.4.0; the old BUILD_* tags do
+  # not match. semver allows three parts at most, so versioning is loose.
+  tag-pattern: '^(3\.\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: loose
+  version: 3.12.4.0
+  # Releases attach only the documentation and the tags are not signed, so
+  # the build clones the tag and checks that it is this commit.
+  git:
+    url: https://github.com/snort3/snort3.git
+    tag: '{version}'
+    commit: 705ecad300ecc903cb5518c816cdc97653948b2f
+  # LibDAQ, the packet acquisition library, compiled into snort. Snort
+  # releases usually need the LibDAQ release that came out with them: the
+  # build stops when this version is older than the minimum in Snort's
+  # cmake/FindDAQ.cmake. LibDAQ attaches nothing to its releases, so this is
+  # GitHub's archive of the tag, whose files were compared with the tagged
+  # commit before the hash was pinned.
+  extra-artifacts:
+    libdaq:
+      version: 3.0.28
+      url: https://github.com/snort3/libdaq/archive/refs/tags/v{version}.tar.gz
+      sha256: a72bc8882abdcfaf475b18d547b5a08785d574005584ce258e533d247bc62771
+image:
+  entrypoint: [snort]
+  cmd: [--help]
+test:
+  - |
+    snort -V > version.txt 2>&1 || { cat version.txt >&2; exit 1; }
+    grep -Fxq "  o\"  )~   Version $VERSION" version.txt \
+      || { echo "expected Snort $VERSION, got:" >&2; cat version.txt >&2; exit 1; }
+    # Optional libraries are found silently at build time, so each one the
+    # image is meant to have must show up here.
+    for want in 'Using Brotli version ' 'Using DAQ version 3.' 'Using Hyperscan version ' \
+        'Using libpcap version ' 'Using LuaJIT version ' 'Using LZMA version ' \
+        'Using OpenSSL 3.' 'Using PCRE2 version ' 'Using ZLIB version '; do
+      grep -Fq "$want" version.txt || { echo "snort -V lacks '$want':" >&2; cat version.txt >&2; exit 1; }
+    done
+    for unwanted in 'Using Jemalloc' 'Using LibML'; do
+      if grep -Fq "$unwanted" version.txt; then echo "unexpected: $unwanted" >&2; exit 1; fi
+    done
+    for tool in snort2lua u2boat u2spewfoo; do
+      command -v "$tool" > /dev/null || { echo "missing: $tool" >&2; exit 1; }
+    done
+  - |
+    # LibDAQ's modules are linked into snort; Snort's own file and hext modules
+    # are loaded from --daq-dir.
+    snort --daq-list > daq-static.txt 2>&1 || { cat daq-static.txt >&2; exit 1; }
+    for m in afpacket bpf dump fst gwlb pcap savefile trace; do
+      grep -Eq "^$m\(v[0-9]+\):" daq-static.txt \
+        || { echo "missing DAQ module $m:" >&2; cat daq-static.txt >&2; exit 1; }
+    done
+    snort --daq-dir /usr/local/lib/snort/daq --daq-list > daq-all.txt 2>&1 || { cat daq-all.txt >&2; exit 1; }
+    for m in file hext; do
+      grep -Eq "^$m\(v[0-9]+\): readback" daq-all.txt \
+        || { echo "missing DAQ module $m:" >&2; cat daq-all.txt >&2; exit 1; }
+    done
+  - |
+    conf=/usr/local/etc/snort/snort.lua
+    snort -c "$conf" -T > validate.txt 2>&1 || { cat validate.txt >&2; exit 1; }
+    grep -Fq 'Snort successfully validated the configuration' validate.txt || { cat validate.txt >&2; exit 1; }
+    # http_inspect has the decompress_brotli parameter only when Snort is
+    # built with Brotli.
+    snort --help-module http_inspect > http_inspect.txt
+    grep -Fq 'http_inspect.decompress_brotli' http_inspect.txt \
+      || { echo 'http_inspect has no decompress_brotli parameter' >&2; exit 1; }
+    snort -c "$conf" --lua 'http_inspect = { decompress_brotli = true }' -T > brotli.txt 2>&1 \
+      || { cat brotli.txt >&2; exit 1; }
+  - |
+    # Three packets from 10.0.0.1 to 10.0.0.2 with valid checksums: an ICMP
+    # echo request, a TCP SYN to port 80 and a DNS query for example.org.
+    {
+      printf '\324\303\262\241\002\000\004\000\000\000\000\000\000\000\000\000\377\377\000\000'
+      printf '\001\000\000\000'
+      printf '\000\271\125\151\000\000\000\000\056\000\000\000\056\000\000\000'
+      printf '\002\000\000\000\000\002\002\000\000\000\000\001\010\000'
+      printf '\105\000\000\040\000\001\100\000\100\001\046\332\012\000\000\001\012\000\000\002'
+      printf '\010\000\006\372\022\064\000\001\160\151\156\147'
+      printf '\001\271\125\151\000\000\000\000\066\000\000\000\066\000\000\000'
+      printf '\002\000\000\000\000\002\002\000\000\000\000\001\010\000'
+      printf '\105\000\000\050\000\002\100\000\100\006\046\314\012\000\000\001\012\000\000\002'
+      printf '\234\100\000\120\000\000\003\350\000\000\000\000\120\002\372\360\000\167\000\000'
+      printf '\002\271\125\151\000\000\000\000\107\000\000\000\107\000\000\000'
+      printf '\002\000\000\000\000\002\002\000\000\000\000\001\010\000'
+      printf '\105\000\000\071\000\003\100\000\100\021\046\257\012\000\000\001\012\000\000\002'
+      printf '\317\010\000\065\000\045\067\274\022\064\001\000\000\001\000\000\000\000\000\000'
+      printf '\007\145\170\141\155\160\154\145\003\157\162\147\000\000\001\000\001'
+    } > sample.pcap
+    # The regex option exists only in builds with Hyperscan.
+    printf '%s\n' \
+      'alert icmp any any -> any any (msg:"icmp echo"; itype:8; sid:1000001; rev:1;)' \
+      'alert udp any any -> any 53 (msg:"dns query"; content:"|07|example|03|org|00|"; sid:1000002; rev:1;)' \
+      'alert tcp any any -> any 80 (msg:"tcp syn"; flags:S; sid:1000003; rev:1;)' \
+      'alert udp any any -> any 53 (msg:"dns regex"; regex:"/exa[m]ple/"; sid:1000004; rev:1;)' \
+      > local.rules
+    run() { snort -q -k none -c /usr/local/etc/snort/snort.lua -R local.rules -r sample.pcap -A alert_fast "$@"; }
+    run > fast.txt 2> fast.err || { cat fast.txt fast.err >&2; exit 1; }
+    for sid in 1000001 1000002 1000003 1000004; do
+      n=$(grep -c "\[1:$sid:1\]" fast.txt || :)
+      [ "$n" -eq 1 ] || { echo "sid $sid: expected 1 alert, got $n" >&2; cat fast.txt fast.err >&2; exit 1; }
+    done
+    # The same alerts with Hyperscan as the fast pattern matcher.
+    run --lua "search_engine = { search_method = 'hyperscan' }" > hyperscan.txt 2> hyperscan.err \
+      || { cat hyperscan.txt hyperscan.err >&2; exit 1; }
+    cmp fast.txt hyperscan.txt || { cat fast.txt hyperscan.txt hyperscan.err >&2; exit 1; }
+  - |
+    # Uses sample.pcap, local.rules and fast.txt from the previous test.
+    conf=/usr/local/etc/snort/snort.lua
+    snort -q -k none -c "$conf" -R local.rules -r sample.pcap -l . -A alert_json \
+      --lua 'alert_json = { file = true }' > json.out 2>&1 || { cat json.out >&2; exit 1; }
+    n=$(grep -c '"rule" : "1:1000001:1"' alert_json.txt || :)
+    [ "$n" -eq 1 ] || { echo "expected 1 JSON alert for sid 1000001, got $n" >&2; cat alert_json.txt >&2; exit 1; }
+    snort -q -k none -c "$conf" -R local.rules -r sample.pcap -l . -A unified2 > u2.out 2>&1 \
+      || { cat u2.out >&2; exit 1; }
+    set -- unified2.log*
+    [ -s "$1" ] || { echo 'no unified2 log was written' >&2; ls -l >&2; exit 1; }
+    u2spewfoo "$1" > u2.txt
+    grep -Eq 'Rule 1:1000003:1[[:space:]]' u2.txt || { cat u2.txt >&2; exit 1; }
+    # u2boat writes the packets in the log to a pcap, which raises the same alerts.
+    u2boat "$1" logged.pcap > u2boat.txt 2>&1 || { cat u2boat.txt >&2; exit 1; }
+    snort -q -k none -c "$conf" -R local.rules -r logged.pcap -A alert_fast > replay.txt 2>&1 \
+      || { cat replay.txt >&2; exit 1; }
+    for f in fast replay; do grep -o '\[1:[0-9]*:1\]' "$f.txt" | sort -u > "$f.sids"; done
+    cmp fast.sids replay.sids || { cat fast.txt replay.txt >&2; exit 1; }
+  - |
+    # An HTTP request written as text and read through the hext DAQ module,
+    # which passes Snort the payload and its flow without a pcap.
+    printf '%s\n' \
+      "\$packet 192.168.1.1 49152 -> 10.1.2.3 80" \
+      '"GET /rc-test HTTP/1.1\r\n"' \
+      '"Host: example.org\r\n"' \
+      '"\r\n"' \
+      > request.hext
+    printf '%s\n' 'alert http (msg:"uri"; http_uri; content:"/rc-test"; sid:1000010; rev:1;)' > http.rules
+    snort -c /usr/local/etc/snort/snort.lua --daq-dir /usr/local/lib/snort/daq --daq hext \
+      -r request.hext -R http.rules -A alert_fast > hext.txt 2>&1 || { cat hext.txt >&2; exit 1; }
+    n=$(grep -c '\[1:1000010:1\]' hext.txt || :)
+    [ "$n" -eq 1 ] || { echo "expected 1 alert for /rc-test, got $n" >&2; cat hext.txt >&2; exit 1; }
+  - |
+    # snort2lua turns Snort 2 content modifiers into Snort 3 sticky buffers.
+    printf '%s\n' 'alert tcp any any -> any 80 (msg:"get"; content:"GET"; http_method; sid:1000020; rev:1;)' \
+      > snort2.conf
+    snort2lua -c snort2.conf -o snort2.lua -r snort2.rules > snort2lua.txt 2>&1 || { cat snort2lua.txt >&2; exit 1; }
+    grep -Eq 'http_method; *content:"GET"' snort2.rules \
+      || { echo 'expected http_method before the content:' >&2; cat snort2.rules >&2; exit 1; }
+    snort -c /usr/local/etc/snort/snort.lua -R snort2.rules -T > snort2.txt 2>&1 || { cat snort2.txt >&2; exit 1; }
+examples:
+  - title: Run the rules in local.rules against capture.pcap and print the alerts
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/snort3 -q -c /usr/local/etc/snort/snort.lua -R local.rules -r capture.pcap -A alert_fast
+  - title: Check that a rules file loads, without reading any packets
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/snort3 -c /usr/local/etc/snort/snort.lua -R local.rules -T
+  - title: Convert a Snort 2 configuration and its rules to Snort 3
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint snort2lua ghcr.io/randomcontainers/snort3 -c snort.conf -o snort.lua -r snort3.rules
+  - title: Inspect the traffic on the host's eth0 with the rules in local.rules
+    command: docker run --rm --user 0 --cap-add NET_RAW --network host --ulimit core=0 -v "$PWD:/work:ro" ghcr.io/randomcontainers/snort3 -c /usr/local/etc/snort/snort.lua -R local.rules -i eth0 -A alert_fast
