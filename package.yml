@@ -17,13 +17,13 @@ upstream:
   tag-pattern: '^(3\.\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: loose
-  version: 3.12.4.0
+  version: 3.13.2.0
   # Releases attach only the documentation and the tags are not signed, so
   # the build clones the tag and checks that it is this commit.
   git:
     url: https://github.com/snort3/snort3.git
     tag: '{version}'
-    commit: 705ecad300ecc903cb5518c816cdc97653948b2f
+    commit: fe29cbe7403acc0dd428065a69d8f29cc311c18e
   # LibDAQ, the packet acquisition library, compiled into snort. Snort
   # releases usually need the LibDAQ release that came out with them: the
   # build stops when this version is older than the minimum in Snort's
